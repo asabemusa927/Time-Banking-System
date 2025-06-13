@@ -642,3 +642,276 @@
     )
   )
 )
+
+
+(define-constant ERR_INVALID_MILESTONE (err u112))
+(define-constant ERR_MILESTONE_COMPLETED (err u113))
+(define-constant ERR_ESCROW_NOT_FOUND (err u114))
+(define-constant ERR_ALL_MILESTONES_COMPLETED (err u115))
+
+(define-map escrows
+  { escrow-id: uint }
+  {
+    transaction-id: uint,
+    provider: principal,
+    consumer: principal,
+    total-amount: uint,
+    released-amount: uint,
+    milestone-count: uint,
+    completed-milestones: uint,
+    status: (string-ascii 20),
+    created-at: uint
+  }
+)
+
+(define-map milestones
+  { escrow-id: uint, milestone-id: uint }
+  {
+    description: (string-ascii 200),
+    amount: uint,
+    completed: bool,
+    completed-at: uint,
+    approved-by-consumer: bool
+  }
+)
+
+(define-data-var escrow-counter uint u0)
+
+(define-public (create-escrow (transaction-id uint) (milestone-descriptions (list 10 (string-ascii 200))) (milestone-amounts (list 10 uint)))
+  (let (
+    (tx (map-get? transactions { id: transaction-id }))
+    (escrow-id (+ (var-get escrow-counter) u1))
+    (consumer tx-sender)
+  )
+    (if (is-none tx)
+      ERR_NOT_FOUND
+      (let (
+        (transaction (unwrap-panic tx))
+        (provider (get provider transaction))
+        (service-id (get service-id transaction))
+        (hours (get hours transaction))
+      )
+        (if (not (is-eq consumer (get consumer transaction)))
+          ERR_UNAUTHORIZED
+          (if (not (is-eq (get status transaction) "approved"))
+            ERR_INVALID_TRANSACTION
+            (let (
+              (service (unwrap-panic (map-get? services { id: service-id })))
+              (rate (get rate service))
+              (total-cost (* hours rate))
+              (milestone-count (len milestone-descriptions))
+              (total-milestone-amount (fold + milestone-amounts u0))
+            )
+              (if (not (is-eq total-cost total-milestone-amount))
+                ERR_INVALID_AMOUNT
+                (begin
+                  (var-set escrow-counter escrow-id)
+                  (map-set escrows
+                    { escrow-id: escrow-id }
+                    {
+                      transaction-id: transaction-id,
+                      provider: provider,
+                      consumer: consumer,
+                      total-amount: total-cost,
+                      released-amount: u0,
+                      milestone-count: milestone-count,
+                      completed-milestones: u0,
+                      status: "active",
+                      created-at: stacks-block-height
+                    }
+                  )
+                  ;; (setup-milestones escrow-id milestone-descriptions milestone-amounts u1)
+                  (map-set transactions
+                    { id: transaction-id }
+                    (merge transaction { status: "escrowed" })
+                  )
+                  (ok escrow-id)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+
+
+(define-public (complete-milestone (escrow-id uint) (milestone-id uint))
+  (let (
+    (escrow (map-get? escrows { escrow-id: escrow-id }))
+    (milestone (map-get? milestones { escrow-id: escrow-id, milestone-id: milestone-id }))
+  )
+    (if (is-none escrow)
+      ERR_ESCROW_NOT_FOUND
+      (if (is-none milestone)
+        ERR_INVALID_MILESTONE
+        (let (
+          (escrow-data (unwrap-panic escrow))
+          (milestone-data (unwrap-panic milestone))
+          (provider (get provider escrow-data))
+        )
+          (if (not (is-eq tx-sender provider))
+            ERR_UNAUTHORIZED
+            (if (get completed milestone-data)
+              ERR_MILESTONE_COMPLETED
+              (begin
+                (map-set milestones
+                  { escrow-id: escrow-id, milestone-id: milestone-id }
+                  (merge milestone-data 
+                    { 
+                      completed: true,
+                      completed-at: stacks-block-height
+                    }
+                  )
+                )
+                (ok true)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-public (approve-milestone (escrow-id uint) (milestone-id uint))
+  (let (
+    (escrow (map-get? escrows { escrow-id: escrow-id }))
+    (milestone (map-get? milestones { escrow-id: escrow-id, milestone-id: milestone-id }))
+  )
+    (if (is-none escrow)
+      ERR_ESCROW_NOT_FOUND
+      (if (is-none milestone)
+        ERR_INVALID_MILESTONE
+        (let (
+          (escrow-data (unwrap-panic escrow))
+          (milestone-data (unwrap-panic milestone))
+          (consumer (get consumer escrow-data))
+          (provider (get provider escrow-data))
+        )
+          (if (not (is-eq tx-sender consumer))
+            ERR_UNAUTHORIZED
+            (if (not (get completed milestone-data))
+              ERR_INVALID_MILESTONE
+              (if (get approved-by-consumer milestone-data)
+                ERR_MILESTONE_COMPLETED
+                (let (
+                  (milestone-amount (get amount milestone-data))
+                  (provider-data (unwrap-panic (map-get? users { user: provider })))
+                  (consumer-data (unwrap-panic (map-get? users { user: consumer })))
+                  (new-released-amount (+ (get released-amount escrow-data) milestone-amount))
+                  (new-completed-milestones (+ (get completed-milestones escrow-data) u1))
+                )
+                  (begin
+                    (map-set milestones
+                      { escrow-id: escrow-id, milestone-id: milestone-id }
+                      (merge milestone-data { approved-by-consumer: true })
+                    )
+                    (map-set users
+                      { user: provider }
+                      (merge provider-data { 
+                        balance: (+ (get balance provider-data) milestone-amount),
+                        reputation: (+ (get reputation provider-data) u1)
+                      })
+                    )
+                    (map-set users
+                      { user: consumer }
+                      (merge consumer-data { 
+                        balance: (- (get balance consumer-data) milestone-amount)
+                      })
+                    )
+                    (map-set escrows
+                      { escrow-id: escrow-id }
+                      (merge escrow-data 
+                        { 
+                          released-amount: new-released-amount,
+                          completed-milestones: new-completed-milestones,
+                          status: (if (is-eq new-completed-milestones (get milestone-count escrow-data)) "completed" "active")
+                        }
+                      )
+                    )
+                    (ok true)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-public (cancel-escrow (escrow-id uint))
+  (let (
+    (escrow (map-get? escrows { escrow-id: escrow-id }))
+  )
+    (if (is-none escrow)
+      ERR_ESCROW_NOT_FOUND
+      (let (
+        (escrow-data (unwrap-panic escrow))
+        (consumer (get consumer escrow-data))
+        (provider (get provider escrow-data))
+        (transaction-id (get transaction-id escrow-data))
+      )
+        (if (and 
+              (not (is-eq tx-sender consumer))
+              (not (is-eq tx-sender provider))
+            )
+          ERR_UNAUTHORIZED
+          (if (not (is-eq (get status escrow-data) "active"))
+            ERR_INVALID_TRANSACTION
+            (begin
+              (map-set escrows
+                { escrow-id: escrow-id }
+                (merge escrow-data { status: "cancelled" })
+              )
+              (map-set transactions
+                { id: transaction-id }
+                { 
+                  provider: provider,
+                  consumer: consumer,
+                  service-id: (get service-id (unwrap-panic (map-get? transactions { id: transaction-id }))),
+                  hours: (get hours (unwrap-panic (map-get? transactions { id: transaction-id }))),
+                  status: "cancelled",
+                  timestamp: (get timestamp (unwrap-panic (map-get? transactions { id: transaction-id })))
+                }
+              )
+              (ok true)
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? escrows { escrow-id: escrow-id })
+)
+
+(define-read-only (get-milestone (escrow-id uint) (milestone-id uint))
+  (map-get? milestones { escrow-id: escrow-id, milestone-id: milestone-id })
+)
+
+(define-read-only (get-escrow-counter)
+  (var-get escrow-counter)
+)
+
+(define-read-only (get-escrow-progress (escrow-id uint))
+  (let ((escrow (map-get? escrows { escrow-id: escrow-id })))
+    (if (is-none escrow)
+      (err "Escrow not found")
+      (let ((escrow-data (unwrap-panic escrow)))
+        (ok {
+          completed: (get completed-milestones escrow-data),
+          total: (get milestone-count escrow-data),
+          released-amount: (get released-amount escrow-data),
+          total-amount: (get total-amount escrow-data)
+        })
+      )
+    )
+  )
+)
