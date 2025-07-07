@@ -648,6 +648,9 @@
 (define-constant ERR_MILESTONE_COMPLETED (err u113))
 (define-constant ERR_ESCROW_NOT_FOUND (err u114))
 (define-constant ERR_ALL_MILESTONES_COMPLETED (err u115))
+(define-constant ERR_ALREADY_REVIEWED (err u116))
+(define-constant ERR_INVALID_RATING (err u117))
+(define-constant ERR_CANNOT_REVIEW_OWN_SERVICE (err u118))
 
 (define-map escrows
   { escrow-id: uint }
@@ -676,6 +679,21 @@
 )
 
 (define-data-var escrow-counter uint u0)
+
+(define-map reviews
+  { review-id: uint }
+  {
+    transaction-id: uint,
+    service-id: uint,
+    reviewer: principal,
+    provider: principal,
+    rating: uint,
+    comment: (string-ascii 500),
+    timestamp: uint
+  }
+)
+
+(define-data-var review-counter uint u0)
 
 (define-public (create-escrow (transaction-id uint) (milestone-descriptions (list 10 (string-ascii 200))) (milestone-amounts (list 10 uint)))
   (let (
@@ -912,6 +930,107 @@
           total-amount: (get total-amount escrow-data)
         })
       )
+    )
+  )
+)
+
+(define-public (submit-review (transaction-id uint) (rating uint) (comment (string-ascii 500)))
+  (let (
+    (tx (map-get? transactions { id: transaction-id }))
+    (reviewer tx-sender)
+    (review-id (+ (var-get review-counter) u1))
+  )
+    (if (is-none tx)
+      ERR_NOT_FOUND
+      (let (
+        (transaction (unwrap-panic tx))
+        (provider (get provider transaction))
+        (consumer (get consumer transaction))
+        (service-id (get service-id transaction))
+      )
+        (if (not (is-eq reviewer consumer))
+          ERR_UNAUTHORIZED
+          (if (is-eq reviewer provider)
+            ERR_CANNOT_REVIEW_OWN_SERVICE
+            (if (not (is-eq (get status transaction) "completed"))
+              ERR_INVALID_TRANSACTION
+              (if (or (< rating u1) (> rating u5))
+                ERR_INVALID_RATING
+                (begin
+                  (var-set review-counter review-id)
+                  (map-set reviews
+                    { review-id: review-id }
+                    {
+                      transaction-id: transaction-id,
+                      service-id: service-id,
+                      reviewer: reviewer,
+                      provider: provider,
+                      rating: rating,
+                      comment: comment,
+                      timestamp: stacks-block-height
+                    }
+                  )
+                  (ok review-id)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-review (review-id uint))
+  (map-get? reviews { review-id: review-id })
+)
+
+(define-read-only (get-review-counter)
+  (var-get review-counter)
+)
+
+(define-read-only (get-service-rating (service-id uint))
+  (let (
+    (review-1 (get-review u1))
+    (review-2 (get-review u2))
+    (review-3 (get-review u3))
+    (review-4 (get-review u4))
+    (review-5 (get-review u5))
+  )
+    (ok (calculate-rating-for-service service-id review-1 review-2 review-3 review-4 review-5))
+  )
+)
+
+(define-private (calculate-rating-for-service (service-id uint) (r1 (optional {transaction-id: uint, service-id: uint, reviewer: principal, provider: principal, rating: uint, comment: (string-ascii 500), timestamp: uint})) (r2 (optional {transaction-id: uint, service-id: uint, reviewer: principal, provider: principal, rating: uint, comment: (string-ascii 500), timestamp: uint})) (r3 (optional {transaction-id: uint, service-id: uint, reviewer: principal, provider: principal, rating: uint, comment: (string-ascii 500), timestamp: uint})) (r4 (optional {transaction-id: uint, service-id: uint, reviewer: principal, provider: principal, rating: uint, comment: (string-ascii 500), timestamp: uint})) (r5 (optional {transaction-id: uint, service-id: uint, reviewer: principal, provider: principal, rating: uint, comment: (string-ascii 500), timestamp: uint})))
+  (let (
+    (rating-1 (if (and (is-some r1) (is-eq (get service-id (unwrap-panic r1)) service-id)) (get rating (unwrap-panic r1)) u0))
+    (rating-2 (if (and (is-some r2) (is-eq (get service-id (unwrap-panic r2)) service-id)) (get rating (unwrap-panic r2)) u0))
+    (rating-3 (if (and (is-some r3) (is-eq (get service-id (unwrap-panic r3)) service-id)) (get rating (unwrap-panic r3)) u0))
+    (rating-4 (if (and (is-some r4) (is-eq (get service-id (unwrap-panic r4)) service-id)) (get rating (unwrap-panic r4)) u0))
+    (rating-5 (if (and (is-some r5) (is-eq (get service-id (unwrap-panic r5)) service-id)) (get rating (unwrap-panic r5)) u0))
+    (total-rating (+ rating-1 (+ rating-2 (+ rating-3 (+ rating-4 rating-5)))))
+    (count (+ (if (> rating-1 u0) u1 u0) (+ (if (> rating-2 u0) u1 u0) (+ (if (> rating-3 u0) u1 u0) (+ (if (> rating-4 u0) u1 u0) (if (> rating-5 u0) u1 u0))))))
+  )
+    (if (is-eq count u0) u0 (/ total-rating count))
+  )
+)
+
+(define-read-only (get-service-review-count (service-id uint))
+  (let (
+    (review-1 (get-review u1))
+    (review-2 (get-review u2))
+    (review-3 (get-review u3))
+    (review-4 (get-review u4))
+    (review-5 (get-review u5))
+  )
+    (+ (if (and (is-some review-1) (is-eq (get service-id (unwrap-panic review-1)) service-id)) u1 u0)
+       (+ (if (and (is-some review-2) (is-eq (get service-id (unwrap-panic review-2)) service-id)) u1 u0)
+          (+ (if (and (is-some review-3) (is-eq (get service-id (unwrap-panic review-3)) service-id)) u1 u0)
+             (+ (if (and (is-some review-4) (is-eq (get service-id (unwrap-panic review-4)) service-id)) u1 u0)
+                (if (and (is-some review-5) (is-eq (get service-id (unwrap-panic review-5)) service-id)) u1 u0)
+             )
+          )
+       )
     )
   )
 )
