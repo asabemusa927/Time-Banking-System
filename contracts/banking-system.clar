@@ -651,6 +651,12 @@
 (define-constant ERR_ALREADY_REVIEWED (err u116))
 (define-constant ERR_INVALID_RATING (err u117))
 (define-constant ERR_CANNOT_REVIEW_OWN_SERVICE (err u118))
+(define-constant ERR_SUBSCRIPTION_NOT_FOUND (err u119))
+(define-constant ERR_SUBSCRIPTION_ALREADY_EXISTS (err u120))
+(define-constant ERR_INVALID_FREQUENCY (err u121))
+(define-constant ERR_SUBSCRIPTION_NOT_ACTIVE (err u122))
+(define-constant ERR_SUBSCRIPTION_PAUSED (err u123))
+(define-constant ERR_PAYMENT_FAILED (err u124))
 
 (define-map escrows
   { escrow-id: uint }
@@ -694,6 +700,26 @@
 )
 
 (define-data-var review-counter uint u0)
+
+;; Subscription system for recurring services
+(define-map subscriptions
+  { subscription-id: uint }
+  {
+    service-id: uint,
+    subscriber: principal,
+    provider: principal,
+    frequency-blocks: uint, ;; blocks between payments
+    amount-per-payment: uint,
+    total-payments: uint,
+    payments-made: uint,
+    status: (string-ascii 20), ;; active, paused, cancelled, completed
+    next-payment-block: uint,
+    created-at: uint,
+    last-payment-block: uint
+  }
+)
+
+(define-data-var subscription-counter uint u0)
 
 (define-public (create-escrow (transaction-id uint) (milestone-descriptions (list 10 (string-ascii 200))) (milestone-amounts (list 10 uint)))
   (let (
@@ -1034,3 +1060,263 @@
     )
   )
 )
+
+;; Create a new subscription for recurring service payments
+(define-public (create-subscription (service-id uint) (frequency-blocks uint) (total-payments uint))
+  (let (
+    (service (map-get? services { id: service-id }))
+    (subscriber tx-sender)
+    (subscription-id (+ (var-get subscription-counter) u1))
+  )
+    (if (is-none service)
+      ERR_INVALID_SERVICE
+      (let (
+        (service-data (unwrap-panic service))
+        (provider (get provider service-data))
+        (rate (get rate service-data))
+      )
+        (if (not (get active service-data))
+          ERR_INVALID_SERVICE
+          (if (is-eq subscriber provider)
+            ERR_CANNOT_REVIEW_OWN_SERVICE ;; reusing error for self-subscription
+            (if (or (<= frequency-blocks u0) (<= total-payments u0))
+              ERR_INVALID_FREQUENCY
+              (if (< (get-user-balance subscriber) rate)
+                ERR_INSUFFICIENT_BALANCE
+                (begin
+                  (var-set subscription-counter subscription-id)
+                  (map-set subscriptions
+                    { subscription-id: subscription-id }
+                    {
+                      service-id: service-id,
+                      subscriber: subscriber,
+                      provider: provider,
+                      frequency-blocks: frequency-blocks,
+                      amount-per-payment: rate,
+                      total-payments: total-payments,
+                      payments-made: u0,
+                      status: "active",
+                      next-payment-block: (+ stacks-block-height frequency-blocks),
+                      created-at: stacks-block-height,
+                      last-payment-block: u0
+                    }
+                  )
+                  (ok subscription-id)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Execute subscription payment if due
+(define-public (process-subscription-payment (subscription-id uint))
+  (let (
+    (subscription (map-get? subscriptions { subscription-id: subscription-id }))
+  )
+    (if (is-none subscription)
+      ERR_SUBSCRIPTION_NOT_FOUND
+      (let (
+        (sub-data (unwrap-panic subscription))
+        (subscriber (get subscriber sub-data))
+        (provider (get provider sub-data))
+        (amount (get amount-per-payment sub-data))
+      )
+        (if (not (is-eq (get status sub-data) "active"))
+          ERR_SUBSCRIPTION_NOT_ACTIVE
+          (if (< stacks-block-height (get next-payment-block sub-data))
+            ERR_INVALID_TRANSACTION ;; payment not yet due
+            (if (< (get-user-balance subscriber) amount)
+              ERR_INSUFFICIENT_BALANCE
+              (let (
+                (subscriber-data (unwrap-panic (map-get? users { user: subscriber })))
+                (provider-data (unwrap-panic (map-get? users { user: provider })))
+                (new-payments-made (+ (get payments-made sub-data) u1))
+                (new-status (if (>= new-payments-made (get total-payments sub-data)) "completed" "active"))
+                (next-payment (if (is-eq new-status "completed") u0 (+ stacks-block-height (get frequency-blocks sub-data))))
+              )
+                (begin
+                  ;; Transfer payment
+                  (map-set users
+                    { user: subscriber }
+                    (merge subscriber-data { 
+                      balance: (- (get balance subscriber-data) amount)
+                    })
+                  )
+                  (map-set users
+                    { user: provider }
+                    (merge provider-data { 
+                      balance: (+ (get balance provider-data) amount),
+                      reputation: (+ (get reputation provider-data) u1)
+                    })
+                  )
+                  ;; Update subscription
+                  (map-set subscriptions
+                    { subscription-id: subscription-id }
+                    (merge sub-data {
+                      payments-made: new-payments-made,
+                      status: new-status,
+                      next-payment-block: next-payment,
+                      last-payment-block: stacks-block-height
+                    })
+                  )
+                  (ok true)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Pause an active subscription
+(define-public (pause-subscription (subscription-id uint))
+  (let (
+    (subscription (map-get? subscriptions { subscription-id: subscription-id }))
+  )
+    (if (is-none subscription)
+      ERR_SUBSCRIPTION_NOT_FOUND
+      (let (
+        (sub-data (unwrap-panic subscription))
+        (subscriber (get subscriber sub-data))
+      )
+        (if (not (is-eq tx-sender subscriber))
+          ERR_UNAUTHORIZED
+          (if (not (is-eq (get status sub-data) "active"))
+            ERR_SUBSCRIPTION_NOT_ACTIVE
+            (begin
+              (map-set subscriptions
+                { subscription-id: subscription-id }
+                (merge sub-data { status: "paused" })
+              )
+              (ok true)
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Resume a paused subscription
+(define-public (resume-subscription (subscription-id uint))
+  (let (
+    (subscription (map-get? subscriptions { subscription-id: subscription-id }))
+  )
+    (if (is-none subscription)
+      ERR_SUBSCRIPTION_NOT_FOUND
+      (let (
+        (sub-data (unwrap-panic subscription))
+        (subscriber (get subscriber sub-data))
+      )
+        (if (not (is-eq tx-sender subscriber))
+          ERR_UNAUTHORIZED
+          (if (not (is-eq (get status sub-data) "paused"))
+            ERR_SUBSCRIPTION_PAUSED
+            (begin
+              (map-set subscriptions
+                { subscription-id: subscription-id }
+                (merge sub-data { 
+                  status: "active",
+                  next-payment-block: (+ stacks-block-height (get frequency-blocks sub-data))
+                })
+              )
+              (ok true)
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Cancel a subscription (can be done by subscriber or provider)
+(define-public (cancel-subscription (subscription-id uint))
+  (let (
+    (subscription (map-get? subscriptions { subscription-id: subscription-id }))
+  )
+    (if (is-none subscription)
+      ERR_SUBSCRIPTION_NOT_FOUND
+      (let (
+        (sub-data (unwrap-panic subscription))
+        (subscriber (get subscriber sub-data))
+        (provider (get provider sub-data))
+      )
+        (if (and 
+              (not (is-eq tx-sender subscriber))
+              (not (is-eq tx-sender provider))
+            )
+          ERR_UNAUTHORIZED
+          (if (is-eq (get status sub-data) "cancelled")
+            ERR_INVALID_TRANSACTION
+            (begin
+              (map-set subscriptions
+                { subscription-id: subscription-id }
+                (merge sub-data { status: "cancelled" })
+              )
+              (ok true)
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Get subscription details
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? subscriptions { subscription-id: subscription-id })
+)
+
+;; Get subscription counter
+(define-read-only (get-subscription-counter)
+  (var-get subscription-counter)
+)
+
+;; Check if subscription payment is due
+(define-read-only (is-subscription-payment-due (subscription-id uint))
+  (let (
+    (subscription (map-get? subscriptions { subscription-id: subscription-id }))
+  )
+    (if (is-none subscription)
+      (err "Subscription not found")
+      (let (
+        (sub-data (unwrap-panic subscription))
+      )
+        (ok (and 
+          (is-eq (get status sub-data) "active")
+          (>= stacks-block-height (get next-payment-block sub-data))
+        ))
+      )
+    )
+  )
+)
+
+;; Get active subscriptions count for a user (as subscriber)
+(define-read-only (get-user-active-subscriptions (user principal))
+  (let (
+    (sub-1 (get-subscription u1))
+    (sub-2 (get-subscription u2))
+    (sub-3 (get-subscription u3))
+    (sub-4 (get-subscription u4))
+    (sub-5 (get-subscription u5))
+  )
+    (+ (if (and (is-some sub-1) (is-eq (get subscriber (unwrap-panic sub-1)) user) (is-eq (get status (unwrap-panic sub-1)) "active")) u1 u0)
+       (+ (if (and (is-some sub-2) (is-eq (get subscriber (unwrap-panic sub-2)) user) (is-eq (get status (unwrap-panic sub-2)) "active")) u1 u0)
+          (+ (if (and (is-some sub-3) (is-eq (get subscriber (unwrap-panic sub-3)) user) (is-eq (get status (unwrap-panic sub-3)) "active")) u1 u0)
+             (+ (if (and (is-some sub-4) (is-eq (get subscriber (unwrap-panic sub-4)) user) (is-eq (get status (unwrap-panic sub-4)) "active")) u1 u0)
+                (if (and (is-some sub-5) (is-eq (get subscriber (unwrap-panic sub-5)) user) (is-eq (get status (unwrap-panic sub-5)) "active")) u1 u0)
+             )
+          )
+       )
+    )
+  )
+)
+
+
+
